@@ -1,0 +1,22 @@
+model_name: "yolo11n-seg.pt"
+pretrained_model_path: ""
+task_override: ""
+profile: "fast"
+
+data: "D:/datasets/your_seg_dataset/data.yaml"
+project_dir: "./runs"
+name: ""
+auto_increment_name: true
+
+epochs: 60
+patience: 12
+batch: 12
+imgsz: 640
+
+rect: true
+multi_scale: true
+
+seed: 0
+deterministic: true
+workers: 4
+device: "auto"

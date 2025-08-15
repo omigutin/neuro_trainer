@@ -1,0 +1,22 @@
+model_name: "yolo11s.pt"
+pretrained_model_path: ""
+task_override: ""
+profile: "quality"
+
+data: "D:/datasets/your_det_dataset/data.yaml"
+project_dir: "./runs"
+name: ""
+auto_increment_name: true
+
+epochs: 150
+patience: 30
+batch: 16
+imgsz: 800
+
+rect: true
+multi_scale: true
+
+seed: 0
+deterministic: true
+workers: 4
+device: "auto"

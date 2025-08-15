@@ -1,0 +1,22 @@
+model_name: "yolo11n-cls.pt"
+pretrained_model_path: ""
+task_override: ""
+profile: "low_vram"
+
+data: "D:/datasets/your_cls_dataset/"
+project_dir: "./runs"
+name: ""
+auto_increment_name: true
+
+epochs: 40
+patience: 10
+batch: 16
+imgsz: 256
+
+rect: false
+multi_scale: false
+
+seed: 0
+deterministic: true
+workers: 4
+device: "auto"

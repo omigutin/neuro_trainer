@@ -1,0 +1,22 @@
+model_name: "yolo11s-cls.pt"
+pretrained_model_path: ""
+task_override: ""
+profile: "quality"
+
+data: "D:/datasets/your_cls_dataset/"
+project_dir: "./runs"
+name: ""
+auto_increment_name: true
+
+epochs: 80
+patience: 15
+batch: 32
+imgsz: 384
+
+rect: false
+multi_scale: false
+
+seed: 0
+deterministic: true
+workers: 4
+device: "auto"
