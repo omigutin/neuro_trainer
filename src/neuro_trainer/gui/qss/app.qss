@@ -1,0 +1,148 @@
+/* ---------- базовое ---------- */
+QWidget {
+    font-family: "Segoe UI", "Inter", "Roboto", "Arial";
+    font-size: 10pt;
+    color: #2D4F87; /* «потёртый» синий */
+}
+
+/* вкладки */
+QTabBar::tab {
+    padding: 6px 14px;
+    margin: 0 3px;
+    border: 1px solid #D0D5DD;
+    border-bottom: none;
+    border-top-left-radius: 10px;
+    border-top-right-radius: 10px;
+    background: #F2F6FF;
+    color: #2D4F87;
+}
+QTabBar::tab:selected { background: #FFFFFF; font-weight: 600; }
+QTabWidget::pane {
+    border: 1px solid #D0D5DD;
+    border-radius: 10px;
+    top: -1px;
+}
+
+/* панели + больше воздуха между ними */
+QGroupBox {
+    font-weight: 600;
+    margin-top: 14px;
+    margin-bottom: 12px;            /* отступ ПОСЛЕ панели */
+    border: 1px solid #DCE2EA;
+    border-radius: 10px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 6px;
+    color: #6A7280;                  /* заголовки серее */
+    background: #F8FAFE;
+}
+
+/* поля ввода — единая высота/радиус */
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QTextEdit {
+    min-height: 28px;
+    padding: 2px 8px;
+    border: 1px solid #D0D5DD;
+    border-radius: 6px;
+    background: #FFFFFF;
+}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QTextEdit:focus {
+    border: 1px solid #4C8BF5;
+    box-shadow: 0 0 0 2px rgba(76,139,245,0.15);
+}
+
+/* у ComboBox видимая стрелка и выпадающее меню */
+QComboBox { padding-right: 28px; }
+QComboBox::drop-down {
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 24px;
+    border-left: 1px solid #D0D5DD;
+    border-top-right-radius: 6px;
+    border-bottom-right-radius: 6px;
+    background: #F7F8FA;
+}
+QComboBox QAbstractItemView {
+    border: 1px solid #D0D5DD;
+    selection-background-color: #EAF2FF;
+    selection-color: #1A1D21;
+}
+
+/* у SpinBox явные кнопки вверх/вниз */
+QAbstractSpinBox { padding-right: 28px; }
+QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {
+    subcontrol-origin: border;
+    width: 22px;
+    border-left: 1px solid #D0D5DD;
+    background: #F7F8FA;
+}
+QAbstractSpinBox::up-button { subcontrol-position: top right; }
+QAbstractSpinBox::down-button { subcontrol-position: bottom right; }
+
+/* чекбоксы (виден disabled) */
+QCheckBox { spacing: 6px; }
+QCheckBox:disabled { color: #9AA1AA; }
+QCheckBox::indicator { width: 16px; height: 16px; }
+QCheckBox::indicator:disabled {
+    background: #EEE; border: 1px solid #DDD; border-radius: 3px;
+}
+
+/* кнопки — одинаковая высота (ширину даём в коде) */
+QPushButton {
+    min-height: 30px;               /* -10% от прежних */
+    padding: 5px 14px;
+    border: 1px solid #D0D5DD;
+    border-radius: 8px;
+    background: #F7F8FA;
+    color: #2D4F87;
+}
+QPushButton:hover { background: #EEF1F5; }
+QPushButton:pressed { background: #E6E9EE; }
+QPushButton:disabled { color: #9AA1AA; background: #F2F4F7; }
+
+/* toolbutton (иконки папки) — квадратные */
+QToolButton {
+    min-height: 28px; min-width: 28px;
+    max-height: 28px; max-width: 28px;
+    border: 1px solid #D0D5DD;
+    border-radius: 6px;
+    background: #FFFFFF;
+}
+QToolButton:hover { background: #F1F5FB; }
+
+/* прогресс-бар */
+QProgressBar {
+    border: 1px solid #D0D5DD;
+    border-radius: 6px;
+    background: #FFFFFF;
+    text-align: center;
+    min-height: 16px;
+}
+QProgressBar::chunk { background-color: #4C8BF5; border-radius: 6px; }
+
+/* текстовые в Help/Progress */
+QTextEdit, QTextBrowser {
+    border: 1px solid #E6E8EB;
+    border-radius: 8px;
+    background: #FFFFFF;
+    padding: 6px;
+}
+
+/* скроллбары */
+QScrollBar:vertical { background: transparent; width: 12px; margin: 2px; }
+QScrollBar::handle:vertical { background: #CBD2DA; border-radius: 6px; min-height: 20px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar:horizontal { background: transparent; height: 12px; margin: 2px; }
+QScrollBar::handle:horizontal { background: #CBD2DA; border-radius: 6px; min-width: 20px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+
+/* тултипы */
+QToolTip {
+    background-color: #1F2937;
+    color: #FFFFFF;
+    border: 1px solid #111827;
+    padding: 4px 6px;
+    border-radius: 6px;
+    font-size: 9.5pt;
+}

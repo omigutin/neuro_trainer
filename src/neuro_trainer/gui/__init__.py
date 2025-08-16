@@ -1,1 +1,1 @@
-from .main_window import launch_gui
+from .main_window import start_app

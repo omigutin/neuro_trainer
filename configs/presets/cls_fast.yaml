@@ -1,22 +1,33 @@
+# Классификация — быстро проверить гипотезу
 model_name: "yolo11n-cls.pt"
-pretrained_model_path: ""
-task_override: ""
+pretrained_model_path: ""   # опционально; обычно не нужно
+task_override: ""           # автоопределение
 profile: "fast"
 
-data: ""
+data: ""                    # путь к датасету / data.yaml / roboflow URL
 project_dir: "./runs"
-name: ""
+name: ""                    # пусто => auto runN
 auto_increment_name: true
 
 epochs: 20
 patience: 5
 batch: 32
-imgsz: 320
-
-rect: false
-multi_scale: false
+imgsz: 320                  # CLS: квадрат, кратный 32 (приведём автоматически)
 
 seed: 0
 deterministic: true
 workers: 4
 device: "auto"
+
+# оптимизация
+lr0: 0.01
+lrf: 0.02
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 2.0
+
+# аугментации/регуляризация (CLS)
+auto_augment: "randaugment" # "augment" | "randaugment" | "none"
+erasing: 0.15               # 0..1
+label_smoothing: 0.05       # 0..1
+dropout: 0.0                # 0..1

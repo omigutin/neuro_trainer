@@ -1,50 +1,52 @@
 from __future__ import annotations
+"""
+MetricsStore — финальные метрики рядом с results.csv.
+Использование в Trainer: MetricsStore.save_final_metrics(run_dir)
+Реализация «best-effort»: если results.csv не найден, пишем пустые структуры.
+"""
 
 from pathlib import Path
-from typing import Any, Dict
-import json, csv
+from typing import Dict, Any
+import csv, json
+
 
 class MetricsStore:
-    """
-    Сохраняет метрики Ultralytics в два файла рядом с results.csv:
-      - final_metrics.json        — удобен для программного чтения
-      - final_metrics_extra.csv   — удобно открыть в Excel
-    Понимает различия задач: CLS vs DET/SEG.
-    """
-    def __init__(self, run_dir: Path) -> None:
-        self.run_dir = Path(run_dir)
-        self.run_dir.mkdir(parents=True, exist_ok=True)
+    @staticmethod
+    def _read_results_csv(run_dir: Path) -> Dict[str, Any]:
+        csv_path = run_dir / "results.csv"
+        if not csv_path.exists():
+            return {}
+        # берём последнюю строку (обычно — итоговая)
+        last_row: Dict[str, str] | None = None
+        with csv_path.open("r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                last_row = row
+        return last_row or {}
 
-    def save(self, metrics_obj: Any, task: str | None) -> Dict[str, Any]:
-        task = (task or "").lower()
-        try:
-            if task == "classifier":
-                payload: Dict[str, Any] = {
-                    "top1": float(getattr(metrics_obj, "top1", 0.0)),
-                    "top5": float(getattr(metrics_obj, "top5", 0.0)),
-                    "fitness": float(getattr(metrics_obj, "fitness", 0.0)),
-                    "speed": getattr(metrics_obj, "speed", {}),
-                }
-            else:
-                box = getattr(metrics_obj, "box", None)
-                if box is not None:
-                    payload = {
-                        "map50_95": float(getattr(box, "map", 0.0)),
-                        "map50": float(getattr(box, "map50", 0.0)),
-                        "map75": float(getattr(box, "map75", 0.0)),
-                        "maps_per_class": list(map(float, getattr(box, "maps", []) or [])),
-                        "speed": getattr(metrics_obj, "speed", {}),
-                    }
+    @staticmethod
+    def save_final_metrics(run_dir: Path | str) -> Dict[str, Any]:
+        d = Path(run_dir)
+        d.mkdir(parents=True, exist_ok=True)
+
+        row = MetricsStore._read_results_csv(d)
+
+        # простая нормализация типов
+        payload: Dict[str, Any] = {}
+        for k, v in row.items():
+            try:
+                vv = v.strip()
+                if vv == "":
+                    payload[k] = v
                 else:
-                    payload = {"raw": getattr(metrics_obj, "__dict__", str(metrics_obj))}
-        except Exception as e:
-            payload = {"error": f"failed to extract metrics: {e}", "raw": str(metrics_obj)}
+                    payload[k] = float(v) if "." in vv or "e" in vv.lower() else int(v)
+            except Exception:
+                payload[k] = v
 
-        (self.run_dir / "final_metrics.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+        (d / "final_metrics.json").write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        with (self.run_dir / "final_metrics_extra.csv").open("w", newline="", encoding="utf-8") as f:
+        with (d / "final_metrics_extra.csv").open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             for k, v in payload.items():
                 w.writerow([k, v])

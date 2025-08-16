@@ -6,7 +6,7 @@ import sys
 
 if __name__ == "__main__":
     try:
-        from neuro_trainer.gui.main_window import start_app
+        from src.neuro_trainer.gui.main_window import start_app
     except ImportError as e:
         print("\n[ERROR] GUI-зависимости не установлены.")
         print("Чтобы запустить графический интерфейс, установи проект с extra `gui`:\n")

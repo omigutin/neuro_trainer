@@ -1,9 +1,10 @@
+# Детекция — экономия VRAM
 model_name: "yolo11n.pt"
 pretrained_model_path: ""
 task_override: ""
 profile: "low_vram"
 
-data: "D:/datasets/your_det_dataset/data.yaml"
+data: ""
 project_dir: "./runs"
 name: ""
 auto_increment_name: true
@@ -20,3 +21,25 @@ seed: 0
 deterministic: true
 workers: 4
 device: "auto"
+
+lr0: 0.008
+lrf: 0.02
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0
+
+hsv_h: 0.015
+hsv_s: 0.70
+hsv_v: 0.40
+
+degrees: 0.0
+translate: 0.10
+scale: 0.50
+shear: 0.0
+perspective: 0.0
+
+flipud: 0.0
+fliplr: 0.5
+
+mosaic: 1.0
+mixup: 0.0

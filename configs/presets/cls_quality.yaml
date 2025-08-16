@@ -1,9 +1,10 @@
+# Классификация — качество
 model_name: "yolo11s-cls.pt"
 pretrained_model_path: ""
 task_override: ""
 profile: "quality"
 
-data: "D:/datasets/your_cls_dataset/"
+data: ""
 project_dir: "./runs"
 name: ""
 auto_increment_name: true
@@ -13,10 +14,18 @@ patience: 15
 batch: 32
 imgsz: 384
 
-rect: false
-multi_scale: false
-
 seed: 0
 deterministic: true
 workers: 4
 device: "auto"
+
+lr0: 0.01
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0
+
+auto_augment: "randaugment"
+erasing: 0.30
+label_smoothing: 0.10
+dropout: 0.10

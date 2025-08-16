@@ -5,6 +5,8 @@ description = ""
 authors = ["omigutin <migutin83@yandex.ru>"]
 readme = "README.md"
 
+packages = [{ include = "neuro_trainer", from = "src" }]
+
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
 matplotlib = {version = "^3.9", optional = true}

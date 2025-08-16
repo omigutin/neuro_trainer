@@ -1,243 +1,213 @@
-# src/neuro_trainer/trainer.py
 from __future__ import annotations
-
-"""
-Trainer — тонкая обёртка над Ultralytics YOLO для обучения/валидации.
-
-Что добавлено:
-- Колбэки:
-  * Ранний стоп по top1 для классификации.
-  * Ранний стоп по mAP50-95 для детекции/сегментации.
-  * JSONL-лог по эпохам (train_metrics.jsonl).
-- Автоподхват task из модели, нормализация imgsz (кратно 32; CLS → квадрат).
-- Сохранение итоговых метрик (final_metrics.json / final_metrics_extra.csv).
-
-Параметры для колбэков:
-- jsonl_log: включить/выключить JSONL-лог (по эпохам).
-- early_stop_cls_threshold, early_stop_cls_patience: порог и «терпение» для CLS.
-- early_stop_map_threshold, early_stop_map_patience: порог и «терпение» для DET/SEG.
-
-Замечание:
-Ultralytics устанавливает `model.trainer.save_dir` уже в начале fit-цикла.
-Мы создаём логгер «лениво»: при первом вызове колбэка берём актуальный save_dir.
-"""
-
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional, Tuple
 
 from ultralytics import YOLO
 
 from .presets import Preset
+from .callbacks import StopController
 from .metrics import MetricsStore
-from .callbacks import EarlyStopOnTop1, EarlyStopOnMap, JsonlLogger, StopOnEvent
+
+# Подпапки для результатов как у Ultralytics
+_TASK_SUBDIR = {"classifier": "classify", "detector": "detect", "segmentation": "segment"}
 
 
 @dataclass(slots=True)
 class Trainer:
-    # Источник весов: имя стандартной модели (yolo11n.pt) ИЛИ абсолютный путь к локальному .pt
+    """
+    Обёртка над Ultralytics YOLO:
+      • создаёт папку сохранения (project_dir/task/run_name)
+      • запускает train()/val()
+      • пишет JSONL-лог по эпохам (для вкладки Progress)
+
+    Примечания:
+      • Параметры аугментаций передаём через getattr(..., None) — если атрибутов нет в инстансе,
+        Ultralytics их просто проигнорирует (это нормально).
+      • 'device="auto"' — даём Ultralytics выбрать устройство; иначе принудительно model.to(device).
+    """
+    # обязательные
     weights: str
-    # Подсказка по типу задачи (может быть пустой: "", тогда определяем из веса)
-    task_hint: str
-    # Данные
+    task_hint: str                # 'classifier' | 'detector' | 'segmentation' (может прийти пустой — но мы его уже нормализуем выше)
     data: str
-    # Куда писать результаты
     project_dir: str
     run_name: str
 
-    # Гиперпараметры/флаги
+    # базовые гиперы
     epochs: int
     patience: int
     batch: int
-    imgsz: int | tuple[int, int]
+    imgsz: int | Tuple[int, int]
     rect: bool
     multi_scale: bool
+
+    # железо/воспроизводимость
     seed: int
     deterministic: bool
     workers: int
-    device: str  # "auto"|"cuda"|"mps"|"cpu"
+    device: str                   # 'auto'|'cuda'|'mps'|'cpu'
 
-    # Пресет (добавляет/переопределяет часть полей в train())
-    preset: Optional[Preset] = None
+    # пресет (подмешиваем значения в train())
+    preset: Preset
 
-    # Колбэки/логирование
-    jsonl_log: bool = True
-    early_stop_cls_threshold: float = 0.95
-    early_stop_cls_patience: int = 3
-    early_stop_map_threshold: float = 0.55
-    early_stop_map_patience: int = 5
-
-    # Выходные поля (заполняются после запуска)
+    # внутренние
     save_dir: Optional[str] = None
-    task: Optional[str] = None
-    jsonl_log_path: Optional[Path] = None  # итоговый путь к train_metrics.jsonl
+    jsonl_log_path: Optional[Path] = None
 
-    # ------------------------
+    # ---------------------------
+    # Внутренняя подготовка
+    # ---------------------------
+    def _build_save_dir(self) -> Path:
+        task_dir = _TASK_SUBDIR.get(self.task_hint or "detector", "detect")
+        d = Path(self.project_dir).resolve() / task_dir / self.run_name
+        d.mkdir(parents=True, exist_ok=True)
+        self.save_dir = str(d)
+        self.jsonl_log_path = d / "train_metrics.jsonl"
+        return d
+
+    def _make_model(self) -> YOLO:
+        model = YOLO(self.weights)
+        # 'auto' — пускай Ultralytics сам выберет (CUDA/MPS/CPU)
+        if self.device != "auto":
+            model.to(self.device)
+        return model
+
+    def _build_callbacks(self) -> dict[str, Any]:
+        """
+        Пользовательские callbacks Ultralytics:
+          • on_train_start — очищаем JSONL
+          • on_fit_epoch_end — добавляем строку с метриками
+          • on_fit_epoch_start — поддержка «мягкой» остановки
+        Best-effort: API Ultralytics иногда меняется между версиями.
+        """
+        dlog = self.jsonl_log_path
+
+        def _safe_get(metrics: Any, path: str, default=None):
+            cur = metrics
+            for p in path.split("."):
+                if cur is None:
+                    return default
+                cur = getattr(cur, p, None) if not isinstance(cur, dict) else cur.get(p)
+            return cur if cur is not None else default
+
+        def on_train_start(trainer):
+            try:
+                dlog.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+
+        def on_fit_epoch_end(trainer):
+            try:
+                row = {
+                    "epoch": int(getattr(trainer, "epoch", 0) + 1),
+                    "epochs": int(getattr(trainer, "epochs", 0)),
+                    "task": (
+                        "classify"
+                        if self.task_hint == "classifier"
+                        else ("segment" if self.task_hint == "segmentation" else "detect")
+                    ),
+                }
+                # Метрики могут лежать либо в trainer.metrics, либо в trainer.validator.metrics
+                m = getattr(trainer, "metrics", None) or getattr(getattr(trainer, "validator", None), "metrics", None)
+
+                if self.task_hint == "classifier":
+                    row["top1"] = float(_safe_get(m, "top1", 0.0))
+                    row["top5"] = float(_safe_get(m, "top5", 0.0))
+                else:
+                    # box mAP
+                    row["map50_95"] = float(_safe_get(getattr(m, "box", None), "map", 0.0))
+                    row["map50"]     = float(_safe_get(getattr(m, "box", None), "map50", 0.0))
+                    row["map75"]     = float(_safe_get(getattr(m, "box", None), "map75", 0.0))
+
+                dlog.open("a", encoding="utf-8").write(__import__("json").dumps(row, ensure_ascii=False) + "\n")
+            except Exception:
+                # Не роняем процесс из-за несовпадения внутренних структур Ultralytics
+                pass
+
+        def on_fit_epoch_start(trainer):
+            if StopController.should_stop():
+                # мягкий ранний стоп
+                raise RuntimeError("Early stop requested")
+
+        return {
+            "on_train_start": on_train_start,
+            "on_fit_epoch_end": on_fit_epoch_end,
+            "on_fit_epoch_start": on_fit_epoch_start,
+        }
+
+    # ---------------------------
     # Публичные методы
-    # ------------------------
-
-    def train(self) -> None:
-        """Полный цикл обучения + сохранение итоговых метрик."""
-        model = YOLO(self.weights)
-
-        # Определяем реальный тип задачи у модели
-        real_task = getattr(model, "task", None) or ""
-        self.task = self._normalize_task_name(self.task_hint or real_task or "detect")
-
-        # Подготовка аргументов обучения
-        train_kwargs = self._build_train_kwargs_for_model(model, self.task)
-
-        # Прицепим колбэки
-        self._attach_callbacks(model, self.task)
-
-        # Запуск обучения
-        model.train(**train_kwargs)
-
-        # Где лежит результат рана
-        self.save_dir = str(Path(model.trainer.save_dir))
-
-        # Итоговые метрики — единообразно после val()
-        metrics = model.val()
-        MetricsStore(Path(self.save_dir)).save(metrics, self.task)
-
+    # ---------------------------
     def validate_only(self) -> None:
-        """Быстрая валидация датасета/модели без обучения (полезно перед долгим train)."""
-        model = YOLO(self.weights)
-
-        real_task = getattr(model, "task", None) or ""
-        self.task = self._normalize_task_name(self.task_hint or real_task or "detect")
-
-        # Валидация с нашими параметрами
-        _, imgsz_norm = self._normalize_imgsz(self.imgsz, self.task)
-        val_results = model.val(data=self.data, imgsz=imgsz_norm, batch=self.batch)
-
-        self.save_dir = str(Path(model.trainer.save_dir))
-        MetricsStore(Path(self.save_dir)).save(val_results, self.task)
-
-    # ------------------------
-    # Внутренняя кухня
-    # ------------------------
-
-    def _build_train_kwargs_for_model(self, model: YOLO, task: str) -> Dict[str, Any]:
-        """Собирает kwargs для model.train, склеивая пользовательские параметры и пресет."""
-        # База
-        kwargs: Dict[str, Any] = dict(
+        save_dir = self._build_save_dir()
+        model = self._make_model()
+        model.val(
             data=self.data,
+            imgsz=self.imgsz,
             project=self.project_dir,
             name=self.run_name,
+            device=None if self.device == "auto" else self.device,
+            workers=self.workers,
+        )
+        try:
+            MetricsStore.save_final_metrics(save_dir)
+        except Exception:
+            pass
+
+    def train(self) -> None:
+        save_dir = self._build_save_dir()
+        model = self._make_model()
+
+        # Подмешиваем пресетные значения
+        preset_kwargs = self.preset.to_train_kwargs() if hasattr(self.preset, "to_train_kwargs") else {}
+
+        callbacks = self._build_callbacks()
+
+        # Запуск обучения
+        model.train(
+            data=self.data,
             epochs=self.epochs,
             patience=self.patience,
             batch=self.batch,
-            verbose=True,                # подробные логи
+            imgsz=self.imgsz,
+            rect=self.rect,
+            multi_scale=self.multi_scale,
+            device=None if self.device == "auto" else self.device,
+            workers=self.workers,
             seed=self.seed,
             deterministic=self.deterministic,
-            workers=self.workers,
+            project=self.project_dir,
+            name=self.run_name,
+            verbose=True,
+
+            # аугментации / доп-параметры (некоторые игнорируются в зависимости от задачи — это ок)
+            hsv_h=getattr(self, "hsv_h", None),
+            hsv_s=getattr(self, "hsv_s", None),
+            hsv_v=getattr(self, "hsv_v", None),
+            degrees=getattr(self, "degrees", None),
+            translate=getattr(self, "translate", None),
+            scale=getattr(self, "scale", None),
+            shear=getattr(self, "shear", None),
+            perspective=getattr(self, "perspective", None),
+            flipud=getattr(self, "flipud", None),
+            fliplr=getattr(self, "fliplr", None),
+            mosaic=getattr(self, "mosaic", None),
+            mixup=getattr(self, "mixup", None),
+            copy_paste=getattr(self, "copy_paste", None),
+            auto_augment=getattr(self, "auto_augment", None),
+            erasing=getattr(self, "erasing", None),
+            label_smoothing=getattr(self, "label_smoothing", None),
+            dropout=getattr(self, "dropout", None),
+
+            # callbacks пользователя
+            callbacks=callbacks,
+
+            # параметры из пресета
+            **preset_kwargs,
         )
 
-        # imgsz: нормализуем (кратно 32; CLS -> квадратный int)
-        rect_flag, imgsz_norm = self._normalize_imgsz(self.imgsz, task)
-        kwargs["imgsz"] = imgsz_norm
-
-        # флаги детекции/сегментации
-        if task in {"detector", "segmentator"}:
-            kwargs["rect"] = self.rect or rect_flag
-            kwargs["multi_scale"] = self.multi_scale
-
-        # Пресет (перекрывает базу только явно заданными полями)
-        if self.preset is not None:
-            for k, v in self.preset.as_train_kwargs().items():
-                if k == "imgsz":
-                    _, v = self._normalize_imgsz(v, task)
-                kwargs[k] = v
-
-        # Устройство
-        device = self._select_device(self.device)
-        model.to(device)
-
-        return kwargs
-
-    def _attach_callbacks(self, model: YOLO, task: str) -> None:
-        """
-        Подключает колбэки Ultralytics:
-        - ранний стоп по top1/mAP (если пороги заданы разумно);
-        - JSONL-лог (если включён).
-        Логгер создаётся «лениво» — на первом вызове берём актуальный save_dir.
-        """
-        # мягкая отмена из GUI
-        model.add_callback("on_fit_epoch_end", StopOnEvent())
-
-        # ранний стоп
-        if task == "classifier" and self.early_stop_cls_threshold > 0 and self.early_stop_cls_patience > 0:
-            model.add_callback("on_fit_epoch_end",
-                               EarlyStopOnTop1(self.early_stop_cls_threshold, self.early_stop_cls_patience))
-        if task in {"detector",
-                    "segmentator"} and self.early_stop_map_threshold > 0 and self.early_stop_map_patience > 0:
-            model.add_callback("on_fit_epoch_end",
-                               EarlyStopOnMap(self.early_stop_map_threshold, self.early_stop_map_patience))
-
-        # JSONL-лог — ленивый инициализатор (как было)
-        if self.jsonl_log:
-            app = self
-
-            class _LazyJsonl:
-                def __init__(self) -> None:
-                    self._logger: Optional[JsonlLogger] = None
-
-                def __call__(self, trainer_obj: Any) -> None:
-                    if self._logger is None:
-                        save_dir = Path(getattr(trainer_obj, "save_dir",
-                                                getattr(getattr(trainer_obj, "model", None), "save_dir", ".")))
-                        save_dir = Path(save_dir);
-                        save_dir.mkdir(parents=True, exist_ok=True)
-                        log_path = save_dir / "train_metrics.jsonl"
-                        app.jsonl_log_path = log_path
-                        self._logger = JsonlLogger(log_path)
-                    self._logger(trainer_obj)
-
-            model.add_callback("on_fit_epoch_end", _LazyJsonl())
-
-    @staticmethod
-    def _normalize_task_name(task: str) -> str:
-        t = (task or "").strip().lower()
-        if t in ("cls", "classify", "classifier"):
-            return "classifier"
-        if t in ("det", "detect", "detector"):
-            return "detector"
-        if t in ("seg", "segment", "segmentor", "segmentator"):
-            return "segmentator"
-        # дефолт — считаем детекцией
-        return "detector"
-
-    def _normalize_imgsz(self, imgsz: int | tuple[int, int], task: str) -> tuple[bool, int | tuple[int, int]]:
-        """
-        Возвращает (rect_flag, imgsz_norm).
-
-        - Классификация: только int (квадрат), округляем до кратного 32.
-        - Детекция/Сегментация: int или (H, W), каждое округляем до кратного 32.
-        - rect_flag: для классификации False; для дет/сег — не навязываем (False).
-        """
-        def to_stride_multiple(x: int, stride: int = 32) -> int:
-            return max(32, int(round(x / stride) * stride))
-
-        if task == "classifier":
-            if isinstance(imgsz, tuple):
-                imgsz = max(int(imgsz[0]), int(imgsz[1]))
-            return False, to_stride_multiple(int(imgsz))
-
-        # detector/segmentator
-        if isinstance(imgsz, tuple):
-            h = to_stride_multiple(int(imgsz[0]))
-            w = to_stride_multiple(int(imgsz[1]))
-            return False, (h, w)
-        return False, to_stride_multiple(int(imgsz))
-
-    @staticmethod
-    def _select_device(device: str) -> str:
-        """
-        Упрощённый выбор устройства.
-        Ultralytics сам корректно обработает 'cuda', 'mps', 'cpu'. 'auto' — оставляем на совесть окружения.
-        """
-        dev = (device or "auto").lower().strip()
-        if dev in ("auto", "cuda", "mps", "cpu"):
-            return dev
-        return "auto"
+        # Итоговые метрики рядом с results.csv
+        try:
+            MetricsStore.save_final_metrics(save_dir)
+        except Exception:
+            pass
