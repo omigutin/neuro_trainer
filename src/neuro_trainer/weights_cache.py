@@ -11,11 +11,9 @@ WeightsCache — локальный кэш предобученных весов
 """
 
 from pathlib import Path
-from typing import Iterable, Optional, List, Tuple
+from typing import Any, Iterable, Optional, List, Tuple
 import shutil
 import glob
-
-from ultralytics import YOLO
 
 
 class WeightsCache:
@@ -40,14 +38,17 @@ class WeightsCache:
         if dst.exists():
             return dst
 
-        # Триггерим загрузку у Ultralytics
+        # Триггерим загрузку у Ultralytics (тяжёлый импорт — только при необходимости)
+        from ultralytics import YOLO
         model = YOLO(model_name)
 
         src = _detect_source_weights_path(model, model_name)
         if src is None or not src.exists():
             raise FileNotFoundError(f"Не удалось найти путь к загруженным весам для '{model_name}'")
 
-        shutil.copy2(src, dst)
+        # Ultralytics мог скачать файл прямо в кэш (если текущий каталог — кэш)
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
         return dst
 
     def prefetch(self, models: Iterable[str]) -> List[Tuple[str, bool, str]]:
@@ -69,7 +70,7 @@ class WeightsCache:
 
 # ---------- helpers ----------
 
-def _detect_source_weights_path(model: YOLO, model_name: str) -> Optional[Path]:
+def _detect_source_weights_path(model: Any, model_name: str) -> Optional[Path]:
     """
     Пытаемся понять, где Ultralytics сохранил вес. В разных версиях атрибуты отличаются,
     поэтому делаем best-effort.

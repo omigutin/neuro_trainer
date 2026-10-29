@@ -1,163 +1,119 @@
 from __future__ import annotations
 import json
 import logging
-from dataclasses import dataclass
+import math
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable
 
-from ultralytics import YOLO
-
-from .presets import Preset
-from .callbacks import StopController
+from .callbacks import StopFlag
 from .metrics import MetricsStore
-
-# Подпапки для результатов как у Ultralytics
-_TASK_SUBDIR = {"classifier": "classify", "detector": "detect", "segmentation": "segment"}
+from .tasks import TaskKind, task_info
 
 _log = logging.getLogger(__name__)
+
+# Имена служебных файлов в папке рана
+PROGRESS_FILE = "train_metrics.jsonl"
+STOP_FILE = "stop.request"
+VAL_METRICS_FILE = "val_metrics.json"
 
 
 @dataclass(slots=True)
 class Trainer:
     """
     Обёртка над Ultralytics YOLO:
-      • создаёт папку сохранения (project_dir/task/run_name)
-      • запускает train()/val()
-      • пишет JSONL-лог по эпохам (для вкладки Progress)
-
-    Примечания:
-      • Значения из GUI имеют приоритет над пресетом; пресет дополняет недостающие параметры.
-      • 'device="auto"' — даём Ultralytics выбрать устройство; иначе принудительно model.to(device).
+      • папка рана: <project_dir>/<задача Ultralytics>/<run_name> (при resume — папка исходного рана);
+      • train() / val();
+      • JSONL-лог метрик по эпохам (для графика прогресса);
+      • «мягкая» остановка по файлу-флагу stop.request после текущей эпохи.
     """
-    # обязательные
+    # Путь к весам: стандартные (скачанные) или свои; при resume — last.pt прерванного рана
     weights: str
-    task_hint: str                # 'classifier' | 'detector' | 'segmentation' (может прийти пустой — но мы его уже нормализуем выше)
+    # Задача обучения
+    task: TaskKind
+    # Датасет: data.yaml или папка (классификация)
     data: str
+    # Корень результатов
     project_dir: str
+    # Имя рана
     run_name: str
+    # Аргументы model.train()/val() из каталога параметров (без data/project/name)
+    train_args: dict[str, Any] = field(default_factory=dict)
+    # Продолжить прерванное обучение (Ultralytics берёт параметры из чекпойнта)
+    resume: bool = False
 
-    # базовые гиперы
-    epochs: int
-    patience: int
-    batch: int
-    imgsz: int | Tuple[int, int]
-    rect: bool
-    multi_scale: bool
+    @property
+    def save_dir(self) -> Path:
+        """ Папка рана. """
+        if self.resume:
+            # .../<run>/weights/last.pt → .../<run>
+            return Path(self.weights).resolve().parent.parent
+        return self._task_project_dir() / self.run_name
 
-    # железо/воспроизводимость
-    seed: int
-    deterministic: bool
-    workers: int
-    device: str                   # 'auto'|'cuda'|'mps'|'cpu'
+    @property
+    def progress_path(self) -> Path:
+        """ JSONL-лог метрик по эпохам. """
+        return self.save_dir / PROGRESS_FILE
 
-    # пресет (подмешиваем значения в train())
-    preset: Preset
-
-    # внутренние
-    save_dir: Optional[str] = None
-    jsonl_log_path: Optional[Path] = None
+    @property
+    def stop_flag(self) -> StopFlag:
+        """ Флаг «мягкой» остановки. """
+        return StopFlag(self.save_dir / STOP_FILE)
 
     # ---------------------------
     # Внутренняя подготовка
     # ---------------------------
     def _task_project_dir(self) -> Path:
         """ Каталог задачи (project_dir/<task>), в нём Ultralytics создаёт папку рана. """
-        task_dir = _TASK_SUBDIR.get(self.task_hint or "detector", "detect")
-        return Path(self.project_dir).resolve() / task_dir
+        return Path(self.project_dir).resolve() / task_info(self.task).ultralytics_task
 
-    def _build_save_dir(self) -> Path:
-        d = self._task_project_dir() / self.run_name
-        d.mkdir(parents=True, exist_ok=True)
-        self.save_dir = str(d)
-        self.jsonl_log_path = d / "train_metrics.jsonl"
-        return d
-
-    def _make_model(self) -> YOLO:
-        model = YOLO(self.weights)
-        # 'auto' — пускай Ultralytics сам выберет (CUDA/MPS/CPU)
-        if self.device != "auto":
-            model.to(self.device)
-        return model
+    def _make_model(self) -> Any:
+        from ultralytics import YOLO  # тяжёлый импорт — только в процессе обучения
+        return YOLO(self.weights)
 
     def _build_callbacks(self) -> dict[str, Callable[[Any], None]]:
         """
         Пользовательские callbacks Ultralytics (регистрируются через model.add_callback):
-          • on_train_start — очищаем JSONL
-          • on_fit_epoch_end — добавляем строку с метриками и обрабатываем «мягкую» остановку
-        Best-effort: API Ultralytics иногда меняется между версиями.
+          • on_train_start — очищаем JSONL (кроме resume);
+          • on_fit_epoch_end — строка с метриками эпохи и обработка «мягкой» остановки.
         """
-        dlog = self.jsonl_log_path
+        progress = self.progress_path
+        stop_flag = self.stop_flag
+        resume = self.resume
 
-        def _safe_get(metrics: Any, path: str, default=None):
-            cur = metrics
-            for p in path.split("."):
-                if cur is None:
-                    return default
-                cur = getattr(cur, p, None) if not isinstance(cur, dict) else cur.get(p)
-            return cur if cur is not None else default
-
-        def on_train_start(trainer):
+        def on_train_start(trainer: Any) -> None:
+            if resume:
+                return
             try:
-                dlog.write_text("", encoding="utf-8")
+                progress.write_text("", encoding="utf-8")
             except OSError as e:
-                _log.warning("Cannot reset progress log %s: %s", dlog, e)
+                _log.warning("Cannot reset progress log %s: %s", progress, e)
 
-        def on_fit_epoch_end(trainer):
+        def on_fit_epoch_end(trainer: Any) -> None:
             try:
-                row = {
-                    "epoch": int(getattr(trainer, "epoch", 0) + 1),
-                    "epochs": int(getattr(trainer, "epochs", 0)),
-                    "task": (
-                        "classify"
-                        if self.task_hint == "classifier"
-                        else ("segment" if self.task_hint == "segmentation" else "detect")
-                    ),
-                }
-                # Метрики могут лежать либо в trainer.metrics, либо в trainer.validator.metrics
-                m = getattr(trainer, "metrics", None) or getattr(getattr(trainer, "validator", None), "metrics", None)
-
-                if self.task_hint == "classifier":
-                    row["top1"] = float(_safe_get(m, "top1", 0.0))
-                    row["top5"] = float(_safe_get(m, "top5", 0.0))
-                else:
-                    # box mAP
-                    row["map50_95"] = float(_safe_get(getattr(m, "box", None), "map", 0.0))
-                    row["map50"]     = float(_safe_get(getattr(m, "box", None), "map50", 0.0))
-                    row["map75"]     = float(_safe_get(getattr(m, "box", None), "map75", 0.0))
-
-                with dlog.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                with progress.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(epoch_row(trainer), ensure_ascii=False) + "\n")
             except (OSError, TypeError, ValueError) as e:
                 # Сбой записи прогресса не должен останавливать обучение
-                _log.warning("Cannot write epoch metrics to %s: %s", dlog, e)
+                _log.warning("Cannot write epoch metrics to %s: %s", progress, e)
 
             # Ultralytics проверяет trainer.stop сразу после on_fit_epoch_end:
-            # обучение корректно завершится после текущей эпохи (с сохранением best/last).
-            if StopController.is_set():
-                _log.info("Stop requested by GUI, finishing after current epoch")
+            # обучение корректно завершится после текущей эпохи (best/last уже сохранены).
+            if stop_flag.is_set():
+                _log.info("Stop requested, finishing after current epoch")
                 trainer.stop = True
 
-        return {
-            "on_train_start": on_train_start,
-            "on_fit_epoch_end": on_fit_epoch_end,
-        }
+        return {"on_train_start": on_train_start, "on_fit_epoch_end": on_fit_epoch_end}
 
     def _build_train_kwargs(self) -> dict[str, Any]:
-        """ Параметры model.train(): пресет как база, значения из GUI поверх (без дублей ключей). """
-        kwargs: dict[str, Any] = self.preset.to_train_kwargs()
+        """ Аргументы model.train(). """
+        if self.resume:
+            return {"resume": True}
+        kwargs: dict[str, Any] = dict(self.train_args)
         kwargs.update(
             data=self.data,
-            epochs=self.epochs,
-            patience=self.patience,
-            batch=self.batch,
-            imgsz=self.imgsz,
-            rect=self.rect,
-            multi_scale=self.multi_scale,
-            device=None if self.device == "auto" else self.device,
-            workers=self.workers,
-            seed=self.seed,
-            deterministic=self.deterministic,
-            # Папку рана уже создали сами (project_dir/<task>/run_name) — Ultralytics пишет в неё же
+            # Папку рана создаём сами (project_dir/<task>/run_name) — Ultralytics пишет в неё же
             project=str(self._task_project_dir()),
             name=self.run_name,
             exist_ok=True,
@@ -168,26 +124,27 @@ class Trainer:
     # ---------------------------
     # Публичные методы
     # ---------------------------
-    def validate_only(self) -> None:
-        save_dir = self._build_save_dir()
+    def validate_only(self) -> dict[str, float]:
+        """ Проверка модели на датасете без обучения; метрики — в val_metrics.json папки рана. """
+        save_dir = self.save_dir
+        save_dir.mkdir(parents=True, exist_ok=True)
         model = self._make_model()
-        model.val(
-            data=self.data,
-            imgsz=self.imgsz,
-            project=str(self._task_project_dir()),
-            name=self.run_name,
-            exist_ok=True,
-            device=None if self.device == "auto" else self.device,
-            workers=self.workers,
-        )
-        MetricsStore.save_final_metrics(save_dir)
+        allowed = ("imgsz", "batch", "device", "workers", "single_cls")
+        val_args = {k: v for k, v in self.train_args.items() if k in allowed}
+        metrics = model.val(data=self.data, project=str(self._task_project_dir()), name=self.run_name,
+                            exist_ok=True, **val_args)
+        results = {k: float(v) for k, v in dict(getattr(metrics, "results_dict", {}) or {}).items()}
+        (save_dir / VAL_METRICS_FILE).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+        return results
 
     def train(self) -> None:
-        save_dir = self._build_save_dir()
-        model = self._make_model()
-
+        """ Обучение (или продолжение прерванного при resume=True). """
+        save_dir = self.save_dir
+        save_dir.mkdir(parents=True, exist_ok=True)
         # Сбрасываем запрос остановки от предыдущего запуска
-        StopController.reset()
+        self.stop_flag.reset()
+
+        model = self._make_model()
         for event, callback in self._build_callbacks().items():
             model.add_callback(event, callback)
 
@@ -195,3 +152,36 @@ class Trainer:
 
         # Итоговые метрики рядом с results.csv
         MetricsStore.save_final_metrics(save_dir)
+
+
+def epoch_row(trainer: Any) -> dict[str, Any]:
+    """
+    Строка JSONL по итогам эпохи: номер эпохи, потери train, метрики val, скорость обучения.
+    Ключи — как в results.csv Ultralytics (metrics/mAP50-95(B), train/box_loss, lr/pg0, ...).
+    """
+    row: dict[str, Any] = {
+        "epoch": int(getattr(trainer, "epoch", 0)) + 1,
+        "epochs": int(getattr(trainer, "epochs", 0)),
+        "time": round(time.time(), 1),
+    }
+    values: dict[str, Any] = {}
+    label_loss_items = getattr(trainer, "label_loss_items", None)
+    tloss = getattr(trainer, "tloss", None)
+    if callable(label_loss_items) and tloss is not None:
+        values.update(label_loss_items(tloss, prefix="train"))
+    values.update(getattr(trainer, "metrics", None) or {})
+    values.update(getattr(trainer, "lr", None) or {})
+    for key, value in values.items():
+        number = _to_float(value)
+        if number is not None:
+            row[str(key)] = number
+    return row
+
+
+def _to_float(value: Any) -> float | None:
+    """ Число (в т.ч. тензор из одного элемента) → float; нечисловое или NaN → None. """
+    try:
+        number = float(value.item() if hasattr(value, "item") else value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(number) or math.isinf(number) else round(number, 6)

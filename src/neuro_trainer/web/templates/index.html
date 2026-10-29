@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Neuro Trainer</title>
+  <link rel="stylesheet" href="{{ base }}/static/app.css">
+</head>
+<body data-base="{{ base }}">
+<header class="topbar">
+  <div class="brand">Neuro Trainer <span class="muted">обучение YOLO</span></div>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-tab="settings" role="tab">Настройки</button>
+    <button class="tab" data-tab="progress" role="tab">Прогресс <span id="tab-job-dot" class="dot" hidden></span></button>
+    <button class="tab" data-tab="help" role="tab">Справка</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ======================= Настройки ======================= -->
+  <section id="tab-settings" class="tab-page active">
+    <div class="hint-line">Наведите курсор на поле — появится подсказка. Изменения сохраняются автоматически.</div>
+
+    <fieldset class="group" id="grp-model">
+      <legend>Модель и источник</legend>
+
+      <div class="row">
+        <div class="field" data-help-key="model_source">
+          <label>Источник модели</label>
+          <div class="seg-control">
+            <label><input type="radio" name="model_source" value="standard"> Стандартная</label>
+            <label><input type="radio" name="model_source" value="custom"> Свой файл (.pt)</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="row" id="std-model-row">
+        <div class="field" data-help-key="family">
+          <label for="f-family">Линейка</label>
+          <select id="f-family"></select>
+        </div>
+        <div class="field" data-help-key="task">
+          <label for="f-task">Задача</label>
+          <select id="f-task"></select>
+        </div>
+        <div class="field" data-help-key="model_name">
+          <label for="f-model_name">Модель</label>
+          <select id="f-model_name"></select>
+        </div>
+      </div>
+
+      <div id="custom-model-block" hidden>
+        <div class="row">
+          <div class="field wide" data-help-key="model_path" data-key="model_path">
+            <label for="f-model_path">Файл весов</label>
+            <div class="path-input">
+              <input id="f-model_path" type="text" placeholder="…\runs\detect\run1\weights\best.pt" spellcheck="false">
+              <button type="button" class="btn" id="btn-browse-weights" data-help="Выбрать файл .pt в проводнике">Выбрать…</button>
+              <button type="button" class="btn" id="btn-inspect" data-help="Прочитать из файла задачу, классы и размер входа">Проверить файл</button>
+            </div>
+            <div class="note" id="custom-model-info"></div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="field" data-help-key="train_mode">
+            <label>Режим</label>
+            <div class="seg-control">
+              <label><input type="radio" name="train_mode" value="finetune"> Дообучение</label>
+              <label><input type="radio" name="train_mode" value="resume"> Продолжить прерванное</label>
+            </div>
+          </div>
+          <div class="field" data-help-key="task">
+            <label>Задача (из файла)</label>
+            <div class="static" id="custom-task-label">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="field wide" data-help-key="data" data-key="data">
+          <label for="f-data">Датасет</label>
+          <div class="path-input">
+            <input id="f-data" type="text" placeholder="data.yaml или папка датасета" spellcheck="false">
+            <button type="button" class="btn" id="btn-browse-data-yaml" data-help="Выбрать data.yaml (детекция, сегментация, pose, OBB)">data.yaml…</button>
+            <button type="button" class="btn" id="btn-browse-data-dir" data-help="Выбрать папку датасета (классификация)">Папка…</button>
+          </div>
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="group" id="grp-device">
+      <legend>Устройство и результаты</legend>
+      <div class="params" data-group="device"></div>
+      <div class="row">
+        <div class="field wide" data-help-key="project_dir" data-key="project_dir">
+          <label for="f-project_dir">Папка результатов</label>
+          <div class="path-input">
+            <input id="f-project_dir" type="text" spellcheck="false">
+            <button type="button" class="btn" id="btn-browse-project" data-help="Выбрать папку результатов">Выбрать…</button>
+            <button type="button" class="btn" id="btn-open-project" data-help="Открыть папку в проводнике">Открыть</button>
+          </div>
+        </div>
+        <div class="field" data-help-key="name" data-key="name">
+          <label for="f-name">Название рана</label>
+          <input id="f-name" type="text" placeholder="авто: run1, run2…" spellcheck="false">
+        </div>
+      </div>
+    </fieldset>
+
+    <fieldset class="group" id="grp-basic">
+      <legend>Параметры обучения</legend>
+      <div class="row profile-row">
+        <div class="field" data-help-key="profile">
+          <label for="f-profile">Профиль</label>
+          <div class="path-input">
+            <select id="f-profile"></select>
+            <button type="button" class="btn" id="btn-apply-profile" data-help="Подставить в форму гиперпараметры профиля для текущей задачи">Подставить</button>
+          </div>
+        </div>
+      </div>
+      <div class="params" data-group="basic"></div>
+    </fieldset>
+
+    <details class="group advanced" id="grp-advanced">
+      <summary>Доп. настройки <span class="muted">— оптимизация, аугментации, потери</span></summary>
+      <div id="advanced-groups"></div>
+    </details>
+
+    <div class="actions">
+      <div class="presets" data-help-key="user_preset">
+        <select id="f-user-preset"><option value="">— свои настройки —</option></select>
+        <button type="button" class="btn" id="btn-load-preset">Загрузить</button>
+        <input id="f-user-preset-name" type="text" placeholder="имя для сохранения" spellcheck="false">
+        <button type="button" class="btn" id="btn-save-preset">Сохранить</button>
+      </div>
+      <div class="run-buttons">
+        <button type="button" class="btn" id="btn-validate" data-help="Прогнать модель по проверочной выборке без обучения: проверить, что датасет и модель читаются, и увидеть исходные метрики">Проверить на датасете</button>
+        <button type="button" class="btn primary" id="btn-train" data-help="Запустить обучение в отдельном процессе">Старт</button>
+      </div>
+    </div>
+    <div id="message" class="message" hidden></div>
+  </section>
+
+  <!-- ======================= Прогресс ======================= -->
+  <section id="tab-progress" class="tab-page">
+    <div class="job-head">
+      <span id="job-state" class="badge">нет запусков</span>
+      <span id="job-epoch" class="muted"></span>
+      <span id="job-dir" class="muted mono"></span>
+      <span class="spacer"></span>
+      <button type="button" class="btn" id="btn-stop" data-help="Завершить обучение после текущей эпохи с сохранением весов">Стоп после эпохи</button>
+      <button type="button" class="btn danger" id="btn-kill" data-help="Прервать процесс немедленно; last.pt — последней сохранённой эпохи">Прервать</button>
+      <button type="button" class="btn" id="btn-open-run" data-help="Открыть папку рана в проводнике">Папка рана</button>
+    </div>
+    <div id="job-error" class="message error" hidden></div>
+    <div class="charts">
+      <div class="chart-box"><div class="chart-title">Метрики (val)</div><div id="chart-metrics" class="chart"></div></div>
+      <div class="chart-box"><div class="chart-title">Потери</div><div id="chart-loss" class="chart"></div></div>
+    </div>
+    <div class="last-metrics" id="last-metrics"></div>
+    <div class="log-box">
+      <div class="chart-title">Вывод процесса (train.log)</div>
+      <pre id="job-log" class="log"></pre>
+    </div>
+  </section>
+
+  <!-- ======================= Справка ======================= -->
+  <section id="tab-help" class="tab-page">
+    <div id="help-content" class="help"></div>
+  </section>
+</main>
+
+<div id="tooltip" role="tooltip" hidden></div>
+<script src="{{ base }}/static/app.js"></script>
+</body>
+</html>

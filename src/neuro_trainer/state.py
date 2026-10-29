@@ -1,132 +1,145 @@
 from __future__ import annotations
 """
-AppState — единое описание состояния настроек тренировки (то, что редактирует GUI).
-Сюда же — конвертеры state_to_dict / state_from_dict для YAML/GUI.
+AppState — состояние настроек обучения (то, что редактирует интерфейс).
+
+Параметры обучения хранятся словарём params по ключам каталога (params_catalog.PARAMS).
+В YAML (last_session.yaml, пользовательские пресеты) всё лежит «плоско» — тот же формат,
+что и раньше, поэтому старые файлы читаются.
 """
 
-from dataclasses import dataclass
-from typing import Literal, Any
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
 
-TaskType = Literal["classifier", "detector", "segmentation"]
-ProfileType = Literal["fast", "quality", "low_vram"]
+from .params_catalog import coerce_values, default_values, format_imgsz, has_param
+from .tasks import TaskKind, parse_task
+
+_log = logging.getLogger(__name__)
+
+
+# Стандартные веса по умолчанию для нового состояния
+DEFAULT_MODEL_NAME = "yolo26n.pt"
+
+
+class ModelSource(str, Enum):
+    """ Откуда берётся модель для обучения. """
+    # Стандартные веса Ultralytics по имени (скачиваются при первом запуске)
+    STANDARD = "standard"
+    # Свой файл .pt (дообучение своей модели)
+    CUSTOM = "custom"
+
+
+class TrainMode(str, Enum):
+    """ Режим обучения от своих весов. """
+    # Новое обучение, начальные веса — выбранный файл
+    FINETUNE = "finetune"
+    # Продолжить прерванное обучение с last.pt (те же параметры, та же папка)
+    RESUME = "resume"
+
+
+class Profile(str, Enum):
+    """ Профиль готовых гиперпараметров (configs/presets/<task>_<profile>.yaml). """
+    FAST = "fast"
+    QUALITY = "quality"
+    LOW_VRAM = "low_vram"
 
 
 @dataclass(slots=True)
 class AppState:
-    # модель: через имя (в кэше configs/weights) или абсолютный путь (наследие)
-    model_name: str = ""
-    model_path: str = ""           # обычно пусто; кастом кладём в configs/weights и выбираем по имени
-    task_override: str = ""        # '' = auto (определим из модели)
-    profile: ProfileType = "fast"
+    """ Настройки обучения. """
+    # Источник модели: стандартные веса или свой файл
+    model_source: ModelSource = ModelSource.STANDARD
+    # Имя стандартных весов (yolo26n.pt и т.п.)
+    model_name: str = DEFAULT_MODEL_NAME
+    # Путь к своему файлу весов
+    model_path: str = ""
+    # Режим для своих весов: дообучение или продолжение прерванного
+    train_mode: TrainMode = TrainMode.FINETUNE
+    # Задача (для своих весов определяется из файла)
+    task: TaskKind = TaskKind.DETECTOR
+    # Профиль, из которого последний раз подставлялись гиперпараметры
+    profile: Profile = Profile.FAST
 
-    # пути/имена
+    # Датасет: data.yaml (детекция/сегментация/pose/obb) или папка (классификация)
     data: str = ""
+    # Корень результатов; ран сохраняется в <project_dir>/<task>/<name>
     project_dir: str = ""
+    # Имя рана (пусто — run1, run2, ...)
     name: str = ""
-    auto_increment_name: bool = True  # всегда включено в UX
+    # Добавлять суффикс 2/3/..., если папка рана уже существует
+    auto_increment_name: bool = True
 
-    # базовые гиперпараметры
-    epochs: int = 50
-    patience: int = 50
-    batch: int = 16
-    imgsz: int | tuple[int, int] = 384
+    # Параметры обучения по ключам каталога
+    params: dict[str, Any] = field(default_factory=default_values)
 
-    # флаги (детекция/сегментация)
-    rect: bool = False
-    multi_scale: bool = False
 
-    # железо/воспроизводимость
-    seed: int = 0
-    deterministic: bool = True
-    workers: int = 4
-    device: str = "auto"           # auto|cuda|mps|cpu
-
-    # --- аугментации (в основном det/seg; часть применима и к cls) ---
-    # цвет
-    hsv_h: float = 0.015
-    hsv_s: float = 0.70
-    hsv_v: float = 0.40
-    # геометрия
-    degrees: float = 0.0
-    translate: float = 0.10
-    scale: float = 0.50
-    shear: float = 0.0
-    perspective: float = 0.0
-    # флипы
-    flipud: float = 0.0
-    fliplr: float = 0.5
-    # миксы
-    mosaic: float = 1.0
-    mixup: float = 0.0
-    copy_paste: float = 0.0   # seg-only
-    # CLS-специфика
-    auto_augment: str = "randaugment"
-    erasing: float = 0.4
-    label_smoothing: float = 0.0
-    dropout: float = 0.0
+# Ключи верхнего уровня (не параметры каталога)
+_STATE_KEYS = ("model_source", "model_name", "model_path", "train_mode", "task", "profile",
+               "data", "project_dir", "name", "auto_increment_name")
 
 
 def state_to_dict(s: AppState) -> dict[str, Any]:
-    imgsz = s.imgsz
-    return {
+    """ Состояние → плоский dict для YAML/веба. """
+    out: dict[str, Any] = {
+        "model_source": s.model_source.value,
         "model_name": s.model_name,
-        "pretrained_model_path": s.model_path,
-        "task_override": s.task_override,
-        "profile": s.profile,
+        "model_path": s.model_path,
+        "train_mode": s.train_mode.value,
+        "task": s.task.value,
+        "profile": s.profile.value,
         "data": s.data,
         "project_dir": s.project_dir,
         "name": s.name,
         "auto_increment_name": s.auto_increment_name,
-        "epochs": s.epochs,
-        "patience": s.patience,
-        "batch": s.batch,
-        "imgsz": imgsz if isinstance(imgsz, int) else f"{imgsz[0]}x{imgsz[1]}",
-        "rect": s.rect,
-        "multi_scale": s.multi_scale,
-        "seed": s.seed,
-        "deterministic": s.deterministic,
-        "workers": s.workers,
-        "device": s.device,
-        "hsv_h": s.hsv_h, "hsv_s": s.hsv_s, "hsv_v": s.hsv_v,
-        "degrees": s.degrees, "translate": s.translate, "scale": s.scale, "shear": s.shear, "perspective": s.perspective,
-        "flipud": s.flipud, "fliplr": s.fliplr,
-        "mosaic": s.mosaic, "mixup": s.mixup, "copy_paste": s.copy_paste,
-        "auto_augment": s.auto_augment, "erasing": s.erasing, "label_smoothing": s.label_smoothing, "dropout": s.dropout,
     }
+    for key, value in s.params.items():
+        out[key] = format_imgsz(value) if key == "imgsz" else value
+    return out
 
 
 def state_from_dict(d: dict[str, Any], default_runs_dir: str) -> AppState:
-    imgsz = d.get("imgsz", 384)
-    if isinstance(imgsz, str) and "x" in imgsz.lower():
-        a, b = imgsz.lower().split("x", 1)
-        imgsz_parsed: int | tuple[int, int] = (int(a), int(b))
-    else:
-        imgsz_parsed = int(imgsz)
+    """
+    Плоский dict → состояние. Понимает старый формат
+    (pretrained_model_path, task_override, multi_scale: bool, label_smoothing).
+    Ошибочные значения параметров заменяются значениями по умолчанию с предупреждением в лог.
+    """
+    model_path = str(d.get("model_path") or d.get("pretrained_model_path") or "")
+    source_raw = d.get("model_source") or (ModelSource.CUSTOM.value if model_path else ModelSource.STANDARD.value)
+
+    task_raw = d.get("task") or d.get("task_override") or ""
+    task = parse_task(task_raw) if task_raw else _task_from_model_name(str(d.get("model_name") or ""))
+
+    raw_params = {k: v for k, v in d.items() if has_param(k)}
+    # В Ultralytics 8.3 multi_scale был флагом; True соответствовал ±50%
+    if isinstance(raw_params.get("multi_scale"), bool):
+        raw_params["multi_scale"] = 0.5 if raw_params["multi_scale"] else 0.0
+    params, errors = coerce_values(raw_params)
+    for key, message in errors.items():
+        _log.warning("Ignored invalid saved value: %s", message)
+
+    ignored = [k for k in d if k not in _STATE_KEYS and not has_param(k)
+               and k not in ("pretrained_model_path", "task_override")]
+    if ignored:
+        _log.warning("Ignored unknown saved keys: %s", ", ".join(sorted(ignored)))
 
     return AppState(
-        model_name=str(d.get("model_name", "")),
-        model_path=str(d.get("pretrained_model_path", "")),
-        task_override=str(d.get("task_override", "")),
-        profile=str(d.get("profile", "fast")),
-        data=str(d.get("data", "")),
-        project_dir=str(d.get("project_dir", default_runs_dir)),
-        name=str(d.get("name", "")),
+        model_source=ModelSource(source_raw),
+        model_name=str(d.get("model_name") or DEFAULT_MODEL_NAME),
+        model_path=model_path,
+        train_mode=TrainMode(d.get("train_mode") or TrainMode.FINETUNE.value),
+        task=task,
+        profile=Profile(d.get("profile") or Profile.FAST.value),
+        data=str(d.get("data") or ""),
+        project_dir=str(d.get("project_dir") or default_runs_dir),
+        name=str(d.get("name") or ""),
         auto_increment_name=bool(d.get("auto_increment_name", True)),
-        epochs=int(d.get("epochs", 50)),
-        patience=int(d.get("patience", 50)),
-        batch=int(d.get("batch", 16)),
-        imgsz=imgsz_parsed,
-        rect=bool(d.get("rect", False)),
-        multi_scale=bool(d.get("multi_scale", False)),
-        seed=int(d.get("seed", 0)),
-        deterministic=bool(d.get("deterministic", True)),
-        workers=int(d.get("workers", 4)),
-        device=str(d.get("device", "auto")),
-        hsv_h=float(d.get("hsv_h", 0.015)), hsv_s=float(d.get("hsv_s", 0.70)), hsv_v=float(d.get("hsv_v", 0.40)),
-        degrees=float(d.get("degrees", 0.0)), translate=float(d.get("translate", 0.10)), scale=float(d.get("scale", 0.50)),
-        shear=float(d.get("shear", 0.0)), perspective=float(d.get("perspective", 0.0)),
-        flipud=float(d.get("flipud", 0.0)), fliplr=float(d.get("fliplr", 0.5)),
-        mosaic=float(d.get("mosaic", 1.0)), mixup=float(d.get("mixup", 0.0)), copy_paste=float(d.get("copy_paste", 0.0)),
-        auto_augment=str(d.get("auto_augment", "randaugment")), erasing=float(d.get("erasing", 0.4)),
-        label_smoothing=float(d.get("label_smoothing", 0.0)), dropout=float(d.get("dropout", 0.0)),
+        params={**default_values(), **params},
     )
+
+
+def _task_from_model_name(model_name: str) -> TaskKind:
+    from .models_registry import ModelsRegistry
+    if model_name and ModelsRegistry.is_known(model_name):
+        return ModelsRegistry.infer_task_from_name(model_name)
+    return TaskKind.DETECTOR

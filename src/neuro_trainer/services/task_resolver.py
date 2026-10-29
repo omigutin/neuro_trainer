@@ -1,17 +1,16 @@
 from __future__ import annotations
+
 from ..models_registry import ModelsRegistry
+from ..tasks import TaskKind
+
 
 class TaskResolver:
     @staticmethod
-    def resolve(models: ModelsRegistry, model_name: str, task_override: str) -> str:
+    def resolve(model_name: str, fallback: TaskKind) -> TaskKind:
         """
-        Возвращает task: 'classifier' | 'detector' | 'segmentation'.
-        Приоритет: task_override > по имени модели > 'detector' (по умолчанию).
+        Задача для стандартных весов — по имени; для прочих имён — fallback
+        (задача своих весов определяется из файла через model_inspector).
         """
-        if task_override:
-            return task_override
-        if model_name:
-            t = models.infer_task_from_name(model_name)
-            if t:
-                return t
-        return "detector"
+        if model_name and ModelsRegistry.is_known(model_name):
+            return ModelsRegistry.infer_task_from_name(model_name)
+        return fallback

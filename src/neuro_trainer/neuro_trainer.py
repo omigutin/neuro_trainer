@@ -1,223 +1,158 @@
-# src/neuro_trainer/app_facade.py
 from __future__ import annotations
+"""
+NeuroTrainerApp — фасад: состояние настроек, профили, пользовательские пресеты
+и сборка задания на обучение (JobSpec) для запуска в отдельном процессе.
+"""
+
 from pathlib import Path
-from typing import Optional, Any
+from typing import Any
 
-from .state import AppState, state_to_dict, state_from_dict
 from .config_store import ConfigStore
+from .job import JobKind, JobSpec
+from .model_inspector import WeightsInfo, inspect_weights
 from .models_registry import ModelsRegistry
-from .presets import PresetRegistry, Preset
-from .trainer import Trainer
-from .metrics import MetricsStore  # noqa: F401  # (используется внутри Trainer)
-from .utils import AppConfigPaths
-
-from .services.validator import ParamValidator
-from .services.task_resolver import TaskResolver
+from .params_catalog import coerce_values, has_param, train_kwargs
+from .presets import PresetRegistry
 from .services.imgsz import normalize_imgsz
 from .services.run_namer import resolve_run_name
-from .services.weights_resolver import WeightsResolver
-from .weights_cache import WeightsCache
+from .services.validator import ParamValidator
+from .state import AppState, ModelSource, Profile, TrainMode, state_from_dict, state_to_dict
+from .tasks import TaskKind, parse_task
+from .utils import AppConfigPaths
 
 
 class NeuroTrainerApp:
-    """
-    Фасад над сервисами — orchestration.
-    """
+    """ Фасад над сервисами — orchestration. """
 
-    def __init__(self, paths: AppConfigPaths, config_store: ConfigStore,
-                 models_registry: ModelsRegistry, presets: PresetRegistry) -> None:
+    def __init__(self, paths: AppConfigPaths, config_store: ConfigStore, presets: PresetRegistry) -> None:
         self._paths = paths
         self._config_store = config_store
-        self._models = models_registry
         self._presets = presets
+        self._state = AppState(project_dir=str(paths.default_runs_dir))
 
-        self._state: AppState = AppState(project_dir=str(paths.default_runs_dir.as_posix()))
-        self._trainer: Optional[Trainer] = None
+    # ---------- состояние ----------
 
-        # сервисы
-        self._weights = WeightsResolver(WeightsCache(paths.weights_dir))
+    @property
+    def paths(self) -> AppConfigPaths:
+        return self._paths
 
-    # ---------- I/O конфигов ----------
+    def state_dict(self) -> dict[str, Any]:
+        """ Текущее состояние в плоском виде (для формы). """
+        return state_to_dict(self._state)
+
+    def update(self, values: dict[str, Any]) -> dict[str, str]:
+        """
+        Применить значения из формы. Корректные значения сохраняются в состоянии,
+        для ошибочных возвращается {ключ: сообщение}.
+        """
+        errors: dict[str, str] = {}
+        s = self._state
+        try:
+            if "model_source" in values:
+                s.model_source = ModelSource(values["model_source"])
+            if "train_mode" in values:
+                s.train_mode = TrainMode(values["train_mode"])
+            if "profile" in values:
+                s.profile = Profile(values["profile"])
+            if "task" in values:
+                s.task = parse_task(values["task"])
+        except ValueError as e:
+            errors["model"] = str(e)
+        for key in ("model_name", "model_path", "data", "project_dir", "name"):
+            if key in values:
+                setattr(s, key, str(values[key] or "").strip())
+        if "auto_increment_name" in values:
+            s.auto_increment_name = bool(values["auto_increment_name"])
+        if s.model_source is ModelSource.STANDARD and s.model_name:
+            if ModelsRegistry.is_known(s.model_name):
+                s.task = ModelsRegistry.infer_task_from_name(s.model_name)
+            else:
+                errors["model_name"] = f"Unknown standard model: {s.model_name}"
+
+        params, param_errors = coerce_values({k: v for k, v in values.items() if has_param(k)})
+        s.params.update(params)
+        errors.update(param_errors)
+        return errors
 
     def load_last_session(self) -> None:
         cfg = self._config_store.load_last_session()
         if cfg:
-            self._state = state_from_dict(cfg, self._paths.default_runs_dir.as_posix())
+            self._state = state_from_dict(cfg, str(self._paths.default_runs_dir))
 
     def save_last_session(self) -> None:
         self._config_store.save_last_session(state_to_dict(self._state))
 
-    def load_preset_yaml(self, path: Path) -> None:
-        cfg = self._config_store.load_yaml(path)
-        self._state = state_from_dict(cfg, self._paths.default_runs_dir.as_posix())
+    # ---------- профили и пользовательские пресеты ----------
 
-    def save_preset_yaml(self, path: Path) -> None:
-        self._config_store.save_yaml(path, state_to_dict(self._state))
+    def profile_values(self, task: TaskKind, profile: Profile) -> dict[str, Any]:
+        """ Гиперпараметры профиля для задачи (без применения к состоянию). """
+        return self._presets.get(task, profile)
 
-    # ---------- выбор модели/профиля ----------
+    def list_user_presets(self) -> list[str]:
+        return self._config_store.list_presets()
 
-    def set_model_by_name(self, name: str) -> None:
-        self._require(self._models.is_known(name), f"Неизвестная модель: {name}")
-        self._state.model_name = name
-        self._state.model_path = ""
-        self._state.task_override = ""
+    def save_user_preset(self, name: str) -> None:
+        self._config_store.save_preset(_safe_name(name), state_to_dict(self._state))
 
-    def set_model_by_path(self, path: Path) -> None:
-        p = path.resolve()
-        self._require(p.exists() and p.is_file(), f"Файл не найден: {p}")
-        self._state.model_path = str(p)
-        self._state.model_name = ""
+    def load_user_preset(self, name: str) -> None:
+        data = self._config_store.load_preset(_safe_name(name))
+        if not data:
+            raise FileNotFoundError(f"Preset '{name}' not found")
+        self._state = state_from_dict(data, str(self._paths.default_runs_dir))
 
-    def set_task_override(self, task: Optional[str]) -> None:
-        if task is None:
-            self._state.task_override = ""
-            return
-        self._require(task in ("classifier", "detector", "segmentation"), "Некорректный тип задачи")
-        self._state.task_override = str(task)
+    # ---------- своя модель ----------
 
-    def set_profile(self, profile: str) -> None:
-        self._require(profile in ("fast", "quality", "low_vram"), "Профиль должен быть fast/quality/low_vram")
-        self._state.profile = str(profile)
+    def inspect_custom_model(self, path: str) -> WeightsInfo:
+        """ Прочитать сведения о своих весах и выставить задачу из файла. """
+        info = inspect_weights(path)
+        self._state.model_source = ModelSource.CUSTOM
+        self._state.model_path = info.path
+        self._state.task = info.task
+        return info
 
-    # ---------- параметры ----------
+    # ---------- задание ----------
 
-    def set_params(self, **kwargs: Any) -> None:
+    def build_job(self, kind: JobKind) -> JobSpec:
+        """ Проверить состояние и собрать задание для процесса обучения. """
         s = self._state
-        if "data" in kwargs and kwargs["data"] is not None:
-            s.data = str(kwargs["data"]).strip()
+        custom = s.model_source is ModelSource.CUSTOM
+        resume = custom and s.train_mode is TrainMode.RESUME and kind is JobKind.TRAIN
+        res = ParamValidator.basic("" if custom else s.model_name, s.model_path if custom else "", s.data,
+                                   need_data=not resume)
+        ParamValidator.require(res.ok, res.message)
+        if custom:
+            ParamValidator.require(Path(s.model_path).is_file(), f"Файл весов не найден: {s.model_path}")
+        if resume:
+            ParamValidator.require(Path(s.model_path).name == "last.pt",
+                                   "Для продолжения прерванного обучения выберите weights/last.pt этого рана.")
 
-        if "project_dir" in kwargs and kwargs["project_dir"] is not None:
-            pd = Path(kwargs["project_dir"]).resolve()
-            pd.mkdir(parents=True, exist_ok=True)
-            s.project_dir = str(pd)
-
-        if "name" in kwargs and kwargs["name"] is not None:
-            s.name = str(kwargs["name"]).strip()
-
-        if "auto_increment_name" in kwargs and kwargs["auto_increment_name"] is not None:
-            s.auto_increment_name = bool(kwargs["auto_increment_name"])
-
-        if "epochs" in kwargs and kwargs["epochs"] is not None:
-            s.epochs = ParamValidator.range_int("epochs", int(kwargs["epochs"]), 1, 1000)
-
-        if "patience" in kwargs and kwargs["patience"] is not None:
-            s.patience = ParamValidator.range_int("patience", int(kwargs["patience"]), 0, 300)
-
-        if "batch" in kwargs and kwargs["batch"] is not None:
-            s.batch = ParamValidator.range_int("batch", int(kwargs["batch"]), 1, 1024)
-
-        if "imgsz" in kwargs and kwargs["imgsz"] is not None:
-            imgsz = kwargs["imgsz"]
-            if isinstance(imgsz, tuple):
-                ParamValidator.require(len(imgsz) == 2 and all(isinstance(x, int) for x in imgsz),
-                                       "imgsz должен быть int или (H, W)")
-                ParamValidator.require(all(64 <= x <= 2048 for x in imgsz),
-                                       "каждое измерение imgsz должно быть в [64..2048]")
-                s.imgsz = (int(imgsz[0]), int(imgsz[1]))
-            else:
-                ParamValidator.require(isinstance(imgsz, int), "imgsz должен быть int или (H, W)")
-                ParamValidator.require(64 <= imgsz <= 2048, "imgsz должен быть в [64..2048]")
-                s.imgsz = int(imgsz)
-
-        if "rect" in kwargs and kwargs["rect"] is not None:
-            s.rect = bool(kwargs["rect"])
-
-        if "multi_scale" in kwargs and kwargs["multi_scale"] is not None:
-            s.multi_scale = bool(kwargs["multi_scale"])
-
-        if "seed" in kwargs and kwargs["seed"] is not None:
-            s.seed = int(kwargs["seed"])
-
-        if "deterministic" in kwargs and kwargs["deterministic"] is not None:
-            s.deterministic = bool(kwargs["deterministic"])
-
-        if "workers" in kwargs and kwargs["workers"] is not None:
-            s.workers = ParamValidator.range_int("workers", int(kwargs["workers"]), 0, 64)
-
-        if "device" in kwargs and kwargs["device"] is not None:
-            ParamValidator.require(kwargs["device"] in ("auto", "cuda", "mps", "cpu"),
-                                   "device должен быть auto/cuda/mps/cpu")
-            s.device = str(kwargs["device"])
-
-    # ---------- валидация/жизненный цикл ----------
-
-    def validate(self) -> tuple[bool, str]:
-        res = ParamValidator.basic(self._state.model_name, self._state.model_path, self._state.data)
-        return (res.ok, res.message)
-
-    def run(self) -> None:
-        self.load_last_session()
-
-    def validate_only(self) -> None:
-        ok, msg = self.validate()
-        self._require(ok, msg)
-        tr = self._prepare_trainer()
-        tr.validate_only()
-        self._trainer = tr
-        self.save_last_session()
-
-    def train(self) -> None:
-        ok, msg = self.validate()
-        self._require(ok, msg)
-        tr = self._prepare_trainer()
-        tr.train()
-        self._trainer = tr
-        self.save_last_session()
-
-    # ---------- utils для GUI ----------
-
-    def open_last_run_folder(self) -> Optional[Path]:
-        if self._trainer is None:
-            return None
-        return Path(self._trainer.save_dir)
-
-    def open_last_log(self) -> Optional[Path]:
-        if self._trainer is None:
-            return None
-        return self._trainer.jsonl_log_path
-
-    # ---------- internal ----------
-
-    def _prepare_trainer(self) -> Trainer:
-        s = self._state
-
-        # task
-        task = TaskResolver.resolve(self._models, s.model_name, s.task_override)
-
-        # weights (локальный путь)
-        weights = self._weights.resolve(s.model_name, s.model_path)
-
-        # preset
-        preset_name = self._presets.resolve_name(task, s.profile)
-        preset: Preset = self._presets.get(preset_name)
-
-        # imgsz
-        imgsz = normalize_imgsz(s.imgsz, task)
-
-        # project/name
-        project_dir = Path(s.project_dir).resolve()
-        run_name = resolve_run_name(project_dir, task, s.name, s.auto_increment_name)
-
-        return Trainer(
-            weights=weights,
-            task_hint=task,
-            data=s.data,
+        params = dict(s.params)
+        params["imgsz"] = normalize_imgsz(params["imgsz"], s.task)
+        project_dir = Path(s.project_dir or self._paths.default_runs_dir).resolve()
+        run_name = "" if resume else resolve_run_name(project_dir, s.task, s.name, s.auto_increment_name)
+        return JobSpec(
+            kind=kind,
+            task=s.task,
+            data=_absolute_if_exists(s.data),
             project_dir=str(project_dir),
             run_name=run_name,
-            epochs=s.epochs,
-            patience=s.patience,
-            batch=s.batch,
-            imgsz=imgsz,
-            rect=s.rect,
-            multi_scale=s.multi_scale,
-            seed=s.seed,
-            deterministic=s.deterministic,
-            workers=s.workers,
-            device=s.device,
-            preset=preset,
+            model_name="" if custom else s.model_name,
+            model_path=str(Path(s.model_path).resolve()) if custom else "",
+            weights_dir=str(self._paths.weights_dir.resolve()),
+            train_args=train_kwargs(params, s.task),
+            resume=resume,
         )
 
-    @staticmethod
-    def _require(cond: bool, msg: str) -> None:
-        if not cond:
-            raise ValueError(msg)
+
+def _absolute_if_exists(value: str) -> str:
+    """ Локальный путь → абсолютный (процесс обучения работает в другом каталоге); URL/имя — как есть. """
+    p = Path(value)
+    return str(p.resolve()) if value and p.exists() else value
+
+
+def _safe_name(name: str) -> str:
+    """ Имя пользовательского пресета без путей. """
+    n = (name or "").strip()
+    if not n or any(c in n for c in '\\/:*?"<>|') or n in (".", ".."):
+        raise ValueError(f"Invalid preset name: {name!r}")
+    return n

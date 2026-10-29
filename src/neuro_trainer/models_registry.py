@@ -1,66 +1,92 @@
 from __future__ import annotations
 """
-ModelsRegistry — список поддерживаемых YOLO-моделей и утилиты.
-Совместимо с NeuroTrainerApp:
-  - get_all_models()
-  - is_known(name: str) -> bool
-  - infer_task_from_name(name: str) -> 'classifier'|'detector'|'segmentation'
+ModelsRegistry — стандартные веса Ultralytics, которые можно скачать по имени.
+
+Список соответствует GITHUB_ASSETS_NAMES Ultralytics 8.4 (ultralytics/utils/downloads.py):
+задачи и размеры, для которых опубликованы готовые .pt.
 """
 
-from typing import List
+from dataclasses import dataclass
+
+from .tasks import TaskKind, TASKS
+
+
+@dataclass(frozen=True, slots=True)
+class ModelFamily:
+    """ Линейка моделей: префикс имени весов и доступные размеры по задачам. """
+    # Идентификатор линейки (значение в форме)
+    key: str
+    # Подпись в интерфейсе
+    label: str
+    # Префикс имени файла: <prefix><size><suffix>.pt
+    prefix: str
+    # Доступные размеры по задачам (порядок — от меньшей модели к большей)
+    sizes: dict[TaskKind, str]
+
+    def models(self, task: TaskKind) -> list[str]:
+        """ Имена весов линейки для задачи. """
+        suffix = TASKS[task].weights_suffix
+        return [f"{self.prefix}{size}{suffix}.pt" for size in self.sizes.get(task, "")]
+
+
+_ALL_TASKS_NSMLX = {task: "nsmlx" for task in TaskKind}
+
+FAMILIES: tuple[ModelFamily, ...] = (
+    ModelFamily("yolo26", "YOLO26", "yolo26", _ALL_TASKS_NSMLX),
+    ModelFamily("yolo11", "YOLO11", "yolo11", _ALL_TASKS_NSMLX),
+    ModelFamily("yolo12", "YOLO12", "yolo12", {TaskKind.DETECTOR: "nsmlx"}),
+    ModelFamily("yolov10", "YOLOv10", "yolov10", {TaskKind.DETECTOR: "nsmblx"}),
+    ModelFamily("yolov9", "YOLOv9", "yolov9", {TaskKind.DETECTOR: "tsmce", TaskKind.SEGMENTATION: "ce"}),
+    ModelFamily("yolov8", "YOLOv8", "yolov8", _ALL_TASKS_NSMLX),
+)
 
 
 class ModelsRegistry:
-    # Версия -> {тип: [модели]}
-    _MODELS = {
-        "v8": {
-            "classifier": ["yolov8n-cls.pt", "yolov8s-cls.pt", "yolov8m-cls.pt", "yolov8l-cls.pt", "yolov8x-cls.pt"],
-            "detector":   ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt"],
-            "segmentation":["yolov8n-seg.pt", "yolov8s-seg.pt", "yolov8m-seg.pt", "yolov8l-seg.pt", "yolov8x-seg.pt"],
-        },
-        "v9": {
-            "classifier": ["yolov9c-cls.pt", "yolov9e-cls.pt"],
-            "detector":   ["yolov9t.pt", "yolov9s.pt", "yolov9m.pt", "yolov9c.pt", "yolov9e.pt"],
-            "segmentation":["yolov9t-seg.pt", "yolov9s-seg.pt", "yolov9m-seg.pt", "yolov9c-seg.pt", "yolov9e-seg.pt"],
-        },
-        "v10": {
-            "classifier": ["yolo10n-cls.pt", "yolo10s-cls.pt", "yolo10m-cls.pt", "yolo10l-cls.pt", "yolo10x-cls.pt"],
-            "detector":   ["yolo10n.pt", "yolo10s.pt", "yolo10m.pt", "yolo10l.pt", "yolo10x.pt"],
-            "segmentation":["yolo10n-seg.pt", "yolo10s-seg.pt", "yolo10m-seg.pt", "yolo10l-seg.pt", "yolo10x-seg.pt"],
-        },
-        "v11": {
-            "classifier": ["yolo11n-cls.pt", "yolo11s-cls.pt", "yolo11m-cls.pt", "yolo11l-cls.pt", "yolo11x-cls.pt"],
-            "detector":   ["yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt"],
-            "segmentation":["yolo11n-seg.pt", "yolo11s-seg.pt", "yolo11m-seg.pt", "yolo11l-seg.pt", "yolo11x-seg.pt"],
-        },
-    }
+    """ Поиск стандартных весов по линейке и задаче. """
 
-    @classmethod
-    def get_all_models(cls) -> List[str]:
-        out: List[str] = []
-        for versions in cls._MODELS.values():
-            for lst in versions.values():
-                out.extend(lst)
-        return out
+    @staticmethod
+    def families() -> tuple[ModelFamily, ...]:
+        """ Все линейки (новые сверху). """
+        return FAMILIES
+
+    @staticmethod
+    def get_family(key: str) -> ModelFamily:
+        """ Линейка по идентификатору. """
+        for family in FAMILIES:
+            if family.key == key:
+                return family
+        raise KeyError(f"Unknown model family '{key}'")
+
+    @staticmethod
+    def get_all_models() -> list[str]:
+        """ Все стандартные веса всех линеек и задач. """
+        return [m for family in FAMILIES for task in TaskKind for m in family.models(task)]
 
     @classmethod
     def is_known(cls, name: str) -> bool:
-        return name.lower() in (m.lower() for m in cls.get_all_models())
+        """ Является ли имя стандартными весами Ultralytics. """
+        return name.lower() in {m.lower() for m in cls.get_all_models()}
 
     @classmethod
-    def infer_task_from_name(cls, name: str) -> str:
+    def infer_task_from_name(cls, name: str) -> TaskKind:
+        """ Задача по имени стандартных весов. """
         n = name.lower()
-        if "cls" in n:
-            return "classifier"
-        if "seg" in n:
-            return "segmentation"
-        # иначе считаем детектором (yolo*.pt)
-        return "detector"
+        for family in FAMILIES:
+            for task in TaskKind:
+                if n in (m.lower() for m in family.models(task)):
+                    return task
+        raise ValueError(f"'{name}' is not a standard Ultralytics weights name")
 
-    @classmethod
-    def get_models_by_task(cls, task: str) -> List[str]:
-        t = task.lower()
-        out: List[str] = []
-        for versions in cls._MODELS.values():
-            out.extend(versions.get(t, []))
-        return out
+    @staticmethod
+    def get_models_by_task(task: TaskKind) -> list[str]:
+        """ Стандартные веса всех линеек для задачи. """
+        return [m for family in FAMILIES for m in family.models(task)]
+
+    @staticmethod
+    def find_family(name: str) -> ModelFamily:
+        """ Линейка, к которой относятся стандартные веса. """
+        n = name.lower()
+        for family in FAMILIES:
+            if any(n == m.lower() for task in TaskKind for m in family.models(task)):
+                return family
+        raise ValueError(f"'{name}' is not a standard Ultralytics weights name")

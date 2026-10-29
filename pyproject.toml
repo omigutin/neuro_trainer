@@ -9,10 +9,14 @@ packages = [{ include = "neuro_trainer", from = "src" }]
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4.0"
-matplotlib = {version = "^3.9", optional = true}
-PySide6 = {version = "^6.9.1", optional = true, markers = "python_version < '3.14'"}
 pyyaml = "^6.0.2"
-ultralytics = "^8.3.179"
+# 8.4 — YOLO26; параметры каталога (params_catalog.py) сверены с ultralytics/cfg/default.yaml 8.4
+ultralytics = ">=8.4.118,<8.5"
+
+# Веб-интерфейс (extra `web`)
+fastapi = {version = ">=0.115,<1", optional = true}
+uvicorn = {version = ">=0.32", optional = true}
+jinja2 = {version = "^3.1", optional = true}
 
 # torch/torchvision с поддержкой CUDA 12.6 (Windows/Linux). На PyPI для Windows есть только CPU-сборка.
 # На macOS CUDA нет — берём обычную сборку с PyPI (MPS).
@@ -26,7 +30,11 @@ torchvision = [
 ]
 
 [tool.poetry.extras]
-gui = ["PySide6", "matplotlib"]
+web = ["fastapi", "uvicorn", "jinja2"]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0"
+httpx = ">=0.27"
 
 [[tool.poetry.source]]
 name = "pytorch-cuda"
@@ -36,3 +44,6 @@ priority = "explicit"
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

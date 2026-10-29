@@ -1,0 +1,27 @@
+# Повёрнутые рамки (OBB) — максимум качества (дольше, больше видеопамяти).
+# Профиль подставляет только гиперпараметры обучения; модель, датасет и устройство не меняет.
+# Описание параметров — подсказки в интерфейсе (src/neuro_trainer/params_catalog.py).
+
+epochs: 150
+patience: 30
+batch: 16
+imgsz: 800
+rect: false
+multi_scale: 0.25
+lr0: 0.01
+lrf: 0.01
+momentum: 0.937
+weight_decay: 0.0005
+warmup_epochs: 3.0
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 0.0
+translate: 0.1
+scale: 0.5
+shear: 0.0
+perspective: 0.0
+flipud: 0.0
+fliplr: 0.5
+mosaic: 1.0
+mixup: 0.0

@@ -1,6 +1,6 @@
 from __future__ import annotations
 """
-Колбэки и контроллер «мягкой» остановки для интеграции с GUI.
+Колбэки и флаг «мягкой» остановки обучения.
 Trainer сейчас пишет JSONL сам через свои callbacks, но эти утилиты могут пригодиться
 для дополнительных сценариев (условный ранний стоп, внешний лог).
 """
@@ -9,33 +9,31 @@ from pathlib import Path
 from typing import Any
 import json
 from datetime import datetime
-import threading
 
 
-# ---------- STOP CONTROLLER ----------
-class StopController:
-    """Глобальный контроллер мягкой отмены из GUI."""
-    _evt = threading.Event()
+# ---------- STOP FLAG ----------
+class StopFlag:
+    """
+    Запрос «мягкой» остановки через файл в папке рана.
+    Работает между процессами: веб-сервер создаёт файл, процесс обучения проверяет его после каждой эпохи.
+    """
 
-    @classmethod
-    def request_stop(cls) -> None:
-        cls._evt.set()
+    def __init__(self, path: Path) -> None:
+        # Путь к файлу-флагу
+        self.path = Path(path)
 
-    @classmethod
-    def reset(cls) -> None:
-        cls._evt.clear()
+    def request(self) -> None:
+        """ Попросить остановиться после текущей эпохи. """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(datetime.now().isoformat(timespec="seconds"), encoding="utf-8")
 
-    @classmethod
-    def is_set(cls) -> bool:
-        return cls._evt.is_set()
+    def reset(self) -> None:
+        """ Снять запрос остановки. """
+        self.path.unlink(missing_ok=True)
 
-
-class StopOnEvent:
-    """Колбэк Ultralytics: если GUI попросил стоп — останавливаем тренировку на границе эпохи."""
-    def __call__(self, trainer: Any) -> None:
-        if StopController.is_set():
-            print("[Callback] Stop requested by GUI.")
-            trainer.stop = True
+    def is_set(self) -> bool:
+        """ Есть ли запрос остановки. """
+        return self.path.exists()
 
 
 # ---------- EARLY STOPS ----------

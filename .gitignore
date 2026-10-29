@@ -208,3 +208,9 @@ __marimo__/
 
 # Weights
 .pt
+
+# neuro_trainer: результаты обучения, кэш весов, последняя сессия
+runs/
+configs/weights/
+configs/last_session.yaml
+*.pt
