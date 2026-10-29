@@ -4,15 +4,20 @@
 from __future__ import annotations
 import sys
 
+# Пакеты, которые ставятся только с extra `gui`
+_GUI_MODULES = {"PySide6", "shiboken6", "matplotlib"}
+
 if __name__ == "__main__":
     try:
         from src.neuro_trainer.gui.main_window import start_app
-    except ImportError as e:
+    except ModuleNotFoundError as e:
+        # Остальные ошибки импорта — не про GUI, их не маскируем
+        if (e.name or "").split(".")[0] not in _GUI_MODULES:
+            raise
         print("\n[ERROR] GUI-зависимости не установлены.")
-        print("Чтобы запустить графический интерфейс, установи проект с extra `gui`:\n")
+        print("Установи проект с extra `gui` (из корня проекта):\n")
         print("    poetry install -E gui\n")
-        print("Или добавь PySide6 напрямую:")
-        print("    poetry add PySide6@^6.9.1\n")
+        print("Подробнее — README.md, раздел «Установка».")
         print(f"(Техническая причина: {e})\n")
         sys.exit(1)
 

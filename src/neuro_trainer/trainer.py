@@ -1,7 +1,9 @@
 from __future__ import annotations
+import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 from ultralytics import YOLO
 
@@ -11,6 +13,8 @@ from .metrics import MetricsStore
 
 # Подпапки для результатов как у Ultralytics
 _TASK_SUBDIR = {"classifier": "classify", "detector": "detect", "segmentation": "segment"}
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -22,8 +26,7 @@ class Trainer:
       • пишет JSONL-лог по эпохам (для вкладки Progress)
 
     Примечания:
-      • Параметры аугментаций передаём через getattr(..., None) — если атрибутов нет в инстансе,
-        Ultralytics их просто проигнорирует (это нормально).
+      • Значения из GUI имеют приоритет над пресетом; пресет дополняет недостающие параметры.
       • 'device="auto"' — даём Ultralytics выбрать устройство; иначе принудительно model.to(device).
     """
     # обязательные
@@ -57,9 +60,13 @@ class Trainer:
     # ---------------------------
     # Внутренняя подготовка
     # ---------------------------
-    def _build_save_dir(self) -> Path:
+    def _task_project_dir(self) -> Path:
+        """ Каталог задачи (project_dir/<task>), в нём Ultralytics создаёт папку рана. """
         task_dir = _TASK_SUBDIR.get(self.task_hint or "detector", "detect")
-        d = Path(self.project_dir).resolve() / task_dir / self.run_name
+        return Path(self.project_dir).resolve() / task_dir
+
+    def _build_save_dir(self) -> Path:
+        d = self._task_project_dir() / self.run_name
         d.mkdir(parents=True, exist_ok=True)
         self.save_dir = str(d)
         self.jsonl_log_path = d / "train_metrics.jsonl"
@@ -72,12 +79,11 @@ class Trainer:
             model.to(self.device)
         return model
 
-    def _build_callbacks(self) -> dict[str, Any]:
+    def _build_callbacks(self) -> dict[str, Callable[[Any], None]]:
         """
-        Пользовательские callbacks Ultralytics:
+        Пользовательские callbacks Ultralytics (регистрируются через model.add_callback):
           • on_train_start — очищаем JSONL
-          • on_fit_epoch_end — добавляем строку с метриками
-          • on_fit_epoch_start — поддержка «мягкой» остановки
+          • on_fit_epoch_end — добавляем строку с метриками и обрабатываем «мягкую» остановку
         Best-effort: API Ultralytics иногда меняется между версиями.
         """
         dlog = self.jsonl_log_path
@@ -93,8 +99,8 @@ class Trainer:
         def on_train_start(trainer):
             try:
                 dlog.write_text("", encoding="utf-8")
-            except Exception:
-                pass
+            except OSError as e:
+                _log.warning("Cannot reset progress log %s: %s", dlog, e)
 
         def on_fit_epoch_end(trainer):
             try:
@@ -119,52 +125,27 @@ class Trainer:
                     row["map50"]     = float(_safe_get(getattr(m, "box", None), "map50", 0.0))
                     row["map75"]     = float(_safe_get(getattr(m, "box", None), "map75", 0.0))
 
-                dlog.open("a", encoding="utf-8").write(__import__("json").dumps(row, ensure_ascii=False) + "\n")
-            except Exception:
-                # Не роняем процесс из-за несовпадения внутренних структур Ultralytics
-                pass
+                with dlog.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            except (OSError, TypeError, ValueError) as e:
+                # Сбой записи прогресса не должен останавливать обучение
+                _log.warning("Cannot write epoch metrics to %s: %s", dlog, e)
 
-        def on_fit_epoch_start(trainer):
-            if StopController.should_stop():
-                # мягкий ранний стоп
-                raise RuntimeError("Early stop requested")
+            # Ultralytics проверяет trainer.stop сразу после on_fit_epoch_end:
+            # обучение корректно завершится после текущей эпохи (с сохранением best/last).
+            if StopController.is_set():
+                _log.info("Stop requested by GUI, finishing after current epoch")
+                trainer.stop = True
 
         return {
             "on_train_start": on_train_start,
             "on_fit_epoch_end": on_fit_epoch_end,
-            "on_fit_epoch_start": on_fit_epoch_start,
         }
 
-    # ---------------------------
-    # Публичные методы
-    # ---------------------------
-    def validate_only(self) -> None:
-        save_dir = self._build_save_dir()
-        model = self._make_model()
-        model.val(
-            data=self.data,
-            imgsz=self.imgsz,
-            project=self.project_dir,
-            name=self.run_name,
-            device=None if self.device == "auto" else self.device,
-            workers=self.workers,
-        )
-        try:
-            MetricsStore.save_final_metrics(save_dir)
-        except Exception:
-            pass
-
-    def train(self) -> None:
-        save_dir = self._build_save_dir()
-        model = self._make_model()
-
-        # Подмешиваем пресетные значения
-        preset_kwargs = self.preset.to_train_kwargs() if hasattr(self.preset, "to_train_kwargs") else {}
-
-        callbacks = self._build_callbacks()
-
-        # Запуск обучения
-        model.train(
+    def _build_train_kwargs(self) -> dict[str, Any]:
+        """ Параметры model.train(): пресет как база, значения из GUI поверх (без дублей ключей). """
+        kwargs: dict[str, Any] = self.preset.to_train_kwargs()
+        kwargs.update(
             data=self.data,
             epochs=self.epochs,
             patience=self.patience,
@@ -176,38 +157,41 @@ class Trainer:
             workers=self.workers,
             seed=self.seed,
             deterministic=self.deterministic,
-            project=self.project_dir,
+            # Папку рана уже создали сами (project_dir/<task>/run_name) — Ultralytics пишет в неё же
+            project=str(self._task_project_dir()),
             name=self.run_name,
+            exist_ok=True,
             verbose=True,
-
-            # аугментации / доп-параметры (некоторые игнорируются в зависимости от задачи — это ок)
-            hsv_h=getattr(self, "hsv_h", None),
-            hsv_s=getattr(self, "hsv_s", None),
-            hsv_v=getattr(self, "hsv_v", None),
-            degrees=getattr(self, "degrees", None),
-            translate=getattr(self, "translate", None),
-            scale=getattr(self, "scale", None),
-            shear=getattr(self, "shear", None),
-            perspective=getattr(self, "perspective", None),
-            flipud=getattr(self, "flipud", None),
-            fliplr=getattr(self, "fliplr", None),
-            mosaic=getattr(self, "mosaic", None),
-            mixup=getattr(self, "mixup", None),
-            copy_paste=getattr(self, "copy_paste", None),
-            auto_augment=getattr(self, "auto_augment", None),
-            erasing=getattr(self, "erasing", None),
-            label_smoothing=getattr(self, "label_smoothing", None),
-            dropout=getattr(self, "dropout", None),
-
-            # callbacks пользователя
-            callbacks=callbacks,
-
-            # параметры из пресета
-            **preset_kwargs,
         )
+        return kwargs
+
+    # ---------------------------
+    # Публичные методы
+    # ---------------------------
+    def validate_only(self) -> None:
+        save_dir = self._build_save_dir()
+        model = self._make_model()
+        model.val(
+            data=self.data,
+            imgsz=self.imgsz,
+            project=str(self._task_project_dir()),
+            name=self.run_name,
+            exist_ok=True,
+            device=None if self.device == "auto" else self.device,
+            workers=self.workers,
+        )
+        MetricsStore.save_final_metrics(save_dir)
+
+    def train(self) -> None:
+        save_dir = self._build_save_dir()
+        model = self._make_model()
+
+        # Сбрасываем запрос остановки от предыдущего запуска
+        StopController.reset()
+        for event, callback in self._build_callbacks().items():
+            model.add_callback(event, callback)
+
+        model.train(**self._build_train_kwargs())
 
         # Итоговые метрики рядом с results.csv
-        try:
-            MetricsStore.save_final_metrics(save_dir)
-        except Exception:
-            pass
+        MetricsStore.save_final_metrics(save_dir)
